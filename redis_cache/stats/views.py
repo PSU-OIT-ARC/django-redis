@@ -13,7 +13,9 @@ from django.utils.decorators import method_decorator
 
 from redis.connection import UnixDomainSocketConnection, Connection
 from redis.connection import DefaultParser
-from ..util import ConnectionPoolHandler
+
+from ..util import load_class
+from ..pool import get_or_create_connection_pool
 
 import redis, re
 
@@ -37,31 +39,30 @@ class RedisStatsView(View):
                 continue
 
             cachedict = {'unix_socket_path': None}
-            server = options.get('LOCATION', 'localhost:6379')
+            servers = options.get('LOCATION', 'localhost:6379')
 
-            if isinstance(server, (list, tuple)):
-                # unsuported sharded connections
-                continue
+            if type(servers) not in [list, tuple]:
+                servers = [servers]
 
-            try:
-                if ":" in server:
-                    host, port = server.split(':')
-                    cachedict['port'] = int(port)
-                    cachedict['host'] = host
-                else:
-                    cachedict['port'] = cachedict['host'] = None
-                    cachedict['unix_socket_path'] = server
-            except (ValueError, TypeError):
-                raise ImproperlyConfigured("port value must be an integer")
+            for server in servers:
+                try:
+                    if ":" in server:
+                        try:
+                            host, port, db = server.split(':')
+                        except ValueError:
+                            host, post = server.split(':')
+                            db = 0
 
-            _options = options.get('OPTIONS', {})
-            try:
-                cachedict['db'] = int(_options.get('DB', 1))
-                cachedict['password'] = _options.get('PASSWORD', None)
-            except (ValueError, TypeError):
-                raise ImproperlyConfigured("db value must be an integer")
+                        cachedict['host'] = host
+                        cachedict['port'] = int(port)
+                        cachedict['db'] = int(db)
+                    else:
+                        cachedict['port'] = cachedict['host'] = None
+                        cachedict['unix_socket_path'] = server
+                except (ValueError, TypeError):
+                    raise ImproperlyConfigured("port value must be an integer")
 
-            caches[name] = cachedict
+                caches['%s@%s' % (name, server)] = cachedict
         return caches
 
     def get_info(self):
@@ -81,9 +82,10 @@ class RedisStatsView(View):
 
         caches_info = {}
         for name, options in self.caches.iteritems():
-            connection_pool = ConnectionPoolHandler()\
-                .connection_pool(parser_class=DefaultParser, **options)
-            rclient = redis.Redis(connection_pool=connection_pool)
+            _pool_cls = load_class(options.get(
+                'CONNECTION_POOL_CLASS', 'redis.connection.ConnectionPool'))
+            rclient = redis.Redis(
+                connection_pool=get_or_create_connection_pool(_pool_cls))
 
             caches_info[name] = rclient.info()
             caches_info[name]['dbs'] = parse_dbs(caches_info[name])
